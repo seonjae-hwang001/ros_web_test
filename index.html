@@ -2,20 +2,25 @@
 <html>
 <head>
 <meta charset="utf-8" />
-<title>ROS Connection Test</title>
+<title>LIMO Web Controller</title>
 <script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
 
+<style>
+  /* 버튼 스타일 꾸미기 */
+  body { text-align: center; font-family: sans-serif; }
+  button { width: 100px; height: 60px; margin: 5px; font-size: 18px; cursor: pointer; }
+  #status { font-weight: bold; color: gray; }
+</style>
+
 <script type="text/javascript">
-  // --- 설정: 로봇 IP로 변경하세요 ---
-  var robot_ip = 'ws://192.168.130.57:9090'; // 본인 로봇 IP 입력
+  // --- [중요] 로봇 IP로 변경하세요 ---
+  var robot_ip = 'ws://192.168.168.57:9090'; 
   // ------------------------------
 
-  var ros = new ROSLIB.Ros({
-    url : robot_ip
-  });
+  var ros = new ROSLIB.Ros({ url : robot_ip });
 
   ros.on('connection', function() {
-    document.getElementById("status").innerHTML = "Status: <span style='color:green'>Connected!</span>";
+    document.getElementById("status").innerHTML = "Status: <span style='color:green'>Connected</span>";
   });
 
   ros.on('error', function(error) {
@@ -26,30 +31,52 @@
     document.getElementById("status").innerHTML = "Status: Closed";
   });
 
-  function sendTestMessage() {
-    var chatTopic = new ROSLIB.Topic({
-      ros : ros,
-      name : '/web_test',
-      messageType : 'std_msgs/String'
-    });
+  // 1. 토픽 설정 (cmd_vel)
+  var cmdVel = new ROSLIB.Topic({
+    ros : ros,
+    name : '/cmd_vel',           // LIMO가 듣는 토픽 이름
+    messageType : 'geometry_msgs/Twist'
+  });
 
-    // 여기를 영어로 변경했습니다
-    var message = new ROSLIB.Message({
-      data : 'Hello ROS! This is from Web.'
+  // 2. 이동 함수 (속도, 회전)
+  function move(linear, angular) {
+    var twist = new ROSLIB.Message({
+      linear : {
+        x : linear,
+        y : 0,
+        z : 0
+      },
+      angular : {
+        x : 0,
+        y : 0,
+        z : angular
+      }
     });
+    cmdVel.publish(twist);
+    console.log("Move: " + linear + ", " + angular);
+  }
 
-    chatTopic.publish(message);
-    alert("Message Sent!");
+  // 3. 정지 함수
+  function stopRobot() {
+    move(0, 0);
   }
 </script>
 </head>
 
 <body>
-  <h1>🤖 ROS Web Test</h1>
-  <p id="status">Status: Connecting...</p>
+  <h1>🎮 LIMO Controller</h1>
+  <p id="status">Connecting...</p>
+  
   <hr/>
-  <button onclick="sendTestMessage()" style="padding: 10px 20px;">
-    Send English Message
-  </button>
+  
+  <div>
+    <button onclick="move(0.2, 0)">Forward</button> <br/>
+    <button onclick="move(0, 0.5)">Left</button>
+    <button onclick="stopRobot()" style="background-color: #ffcccc;">STOP</button>
+    <button onclick="move(0, -0.5)">Right</button> <br/>
+    <button onclick="move(-0.2, 0)">Backward</button>
+  </div>
+
+  <p>⚠️ Safety: Be careful with the robot speed!</p>
 </body>
 </html>
