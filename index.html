@@ -1,82 +1,236 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
 <head>
 <meta charset="utf-8" />
-<title>LIMO Web Controller</title>
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>LIMO Smart Delivery</title>
+<script src="https://cdn.tailwindcss.com"></script>
 <script src="https://cdn.jsdelivr.net/npm/roslib@1/build/roslib.min.js"></script>
 
-<style>
-  /* 버튼 스타일 꾸미기 */
-  body { text-align: center; font-family: sans-serif; }
-  button { width: 100px; height: 60px; margin: 5px; font-size: 18px; cursor: pointer; }
-  #status { font-weight: bold; color: gray; }
-</style>
-
 <script type="text/javascript">
-  // --- [중요] 로봇 IP로 변경하세요 ---
-  var robot_ip = 'ws://192.168.168.57:9090'; 
-  // ------------------------------
+  // [설정] 본인의 로봇 IP로 변경하세요
+  const ROBOT_IP = 'ws://192.168.180.57:9090'; 
 
-  var ros = new ROSLIB.Ros({ url : robot_ip });
+  let ros = null;
+  let lockTopic = null;     // 문 잠그기 (C)
+  let unlockTopic = null;   // 문 열기 (O)
+  let resetTopic = null;    // 시스템 리셋
+  let resetListener = null;
+  let pinParam = null; 
+  
+  let currentScreenState = 'unknown';
+  let isCreator = false; 
 
-  ros.on('connection', function() {
-    document.getElementById("status").innerHTML = "Status: <span style='color:green'>Connected</span>";
-  });
+  window.onload = function() {
+    initROS();
+  };
 
-  ros.on('error', function(error) {
-    document.getElementById("status").innerHTML = "Status: <span style='color:red'>Error</span>";
-  });
+  function initROS() {
+    ros = new ROSLIB.Ros({ url : ROBOT_IP });
 
-  ros.on('close', function() {
-    document.getElementById("status").innerHTML = "Status: Closed";
-  });
+    ros.on('connection', () => {
+      updateStatus("🟢 Connected", "text-green-600");
+      setInterval(checkServerState, 1000); 
+    });
 
-  // 1. 토픽 설정 (cmd_vel)
-  var cmdVel = new ROSLIB.Topic({
-    ros : ros,
-    name : '/cmd_vel',           // LIMO가 듣는 토픽 이름
-    messageType : 'geometry_msgs/Twist'
-  });
+    ros.on('error', () => {
+      updateStatus("🔴 Connection Failed", "text-red-600");
+    });
 
-  // 2. 이동 함수 (속도, 회전)
-  function move(linear, angular) {
-    var twist = new ROSLIB.Message({
-      linear : {
-        x : linear,
-        y : 0,
-        z : 0
-      },
-      angular : {
-        x : 0,
-        y : 0,
-        z : angular
+    // 1. 문 잠그기 토픽 (Python의 lock_callback과 연결)
+    lockTopic = new ROSLIB.Topic({
+      ros : ros,
+      name : '/limo_lock_cmd',
+      messageType : 'std_msgs/String'
+    });
+
+    // 2. 문 열기 토픽 (Python의 unlock_callback과 연결)
+    unlockTopic = new ROSLIB.Topic({
+      ros : ros,
+      name : '/limo_unlock_cmd',
+      messageType : 'std_msgs/String'
+    });
+
+    // 3. 리셋 토픽
+    resetTopic = new ROSLIB.Topic({
+      ros : ros,
+      name : '/limo_reset_cmd',
+      messageType : 'std_msgs/String'
+    });
+
+    resetListener = new ROSLIB.Topic({
+      ros : ros,
+      name : '/limo_reset_done',
+      messageType : 'std_msgs/String'
+    });
+
+    resetListener.subscribe(function(message) {
+      if (message.data === "reset_complete") {
+        console.log("Reset complete. Reloading...");
+        location.reload();
       }
     });
-    cmdVel.publish(twist);
-    console.log("Move: " + linear + ", " + angular);
+
+    pinParam = new ROSLIB.Param({
+      ros : ros,
+      name : '/global_pin_code'
+    });
   }
 
-  // 3. 정지 함수
-  function stopRobot() {
-    move(0, 0);
+  function updateStatus(msg, colorClass) {
+    const statusEl = document.getElementById("status");
+    if(statusEl) {
+        statusEl.innerHTML = msg;
+        statusEl.className = "text-sm font-bold mb-6 " + colorClass;
+    }
+  }
+
+  function checkServerState() {
+    pinParam.get(function(value) {
+      // 1. 비밀번호가 설정됨 (배송 중)
+      if (value && value !== 'null' && value !== 0) {
+        if (isCreator) {
+             return; // 내가 만든 사람이면 화면 유지
+        }
+        if (currentScreenState !== 'input' && currentScreenState !== 'success') {
+            showScreen('input'); // 다른 사람은 입력 화면으로
+        }
+      } 
+      // 2. 비밀번호 없음 (대기 중)
+      else {
+        if (currentScreenState !== 'generate') {
+            showScreen('generate');
+        }
+      }
+    });
+  }
+
+  function showScreen(type) {
+    currentScreenState = type;
+    document.getElementById('view-generate').style.display = 'none';
+    document.getElementById('view-input').style.display = 'none';
+    document.getElementById('view-success').style.display = 'none';
+
+    if (type === 'generate') document.getElementById('view-generate').style.display = 'block';
+    else if (type === 'input') document.getElementById('view-input').style.display = 'block';
+    else if (type === 'success') document.getElementById('view-success').style.display = 'block';
+  }
+
+  // [핵심 1] 비밀번호 생성 -> "문 잠가라(lock_now)" 신호 전송
+  function generatePin() {
+    const btn = document.getElementById('gen-btn');
+    btn.disabled = true;
+    btn.innerText = "문 잠그는 중...";
+
+    const newPin = Math.floor(1000 + Math.random() * 9000);
+    isCreator = true; 
+
+    // 파이썬으로 잠금 신호 전송 (아두이노가 'C' 받음)
+    let msg = new ROSLIB.Message({ data : "lock_now" });
+    lockTopic.publish(msg);
+
+    // 비밀번호 설정 (약간의 딜레이 후)
+    setTimeout(() => {
+        pinParam.set(newPin); 
+        document.getElementById('generated-pin-display').innerText = newPin;
+        document.getElementById('gen-btn-area').style.display = 'none';
+        document.getElementById('gen-result-area').style.display = 'block';
+    }, 200);
+  }
+
+  // [핵심 2] 비밀번호 일치 -> "문 열어라(unlock_now)" 신호 전송
+  function tryUnlock() {
+    const inputPin = document.getElementById('pin-input').value;
+    const btn = document.getElementById('unlock-btn');
+
+    btn.disabled = true;
+    btn.innerText = "확인 중...";
+
+    pinParam.get(function(serverPin) {
+      if (serverPin && String(serverPin) === inputPin) {
+        showScreen('success'); 
+        
+        // 파이썬으로 열기 신호 전송 (아두이노가 'O' 받음)
+        let msg = new ROSLIB.Message({ data : "unlock_now" });
+        unlockTopic.publish(msg);
+        
+      } else {
+        alert("⛔ 비밀번호가 틀렸습니다!");
+        btn.disabled = false;
+        btn.innerText = "🔓 잠금 해제";
+      }
+    });
+  }
+
+  // 수령 완료 -> 시스템 리셋만 (문은 안 움직임)
+  function completeDelivery() {
+    const btn = document.getElementById('close-btn');
+    btn.disabled = true;
+    btn.innerText = "초기화 중...";
+
+    // 시스템 리셋 신호 전송
+    let msg = new ROSLIB.Message({ data : "reset_system" });
+    resetTopic.publish(msg);
   }
 </script>
 </head>
 
-<body>
-  <h1>🎮 LIMO Controller</h1>
-  <p id="status">Connecting...</p>
-  
-  <hr/>
-  
-  <div>
-    <button onclick="move(0.2, 0)">Forward</button> <br/>
-    <button onclick="move(0, 0.5)">Left</button>
-    <button onclick="stopRobot()" style="background-color: #ffcccc;">STOP</button>
-    <button onclick="move(0, -0.5)">Right</button> <br/>
-    <button onclick="move(-0.2, 0)">Backward</button>
-  </div>
+<body class="bg-gray-800 flex items-center justify-center h-screen font-sans">
+  <div class="bg-white p-8 rounded-2xl shadow-2xl w-full max-w-sm text-center">
+    
+    <div class="mb-6">
+      <h1 class="text-2xl font-extrabold text-gray-800">LIMO DELIVERY</h1>
+      <p class="text-xs text-gray-400 mt-1">Smart Pickup System</p>
+    </div>
 
-  <p>⚠️ Safety: Be careful with the robot speed!</p>
+    <p id="status" class="text-sm text-gray-400 mb-6 font-bold">⚪ Connecting...</p>
+
+    <!-- 1. 생성 화면 -->
+    <div id="view-generate" style="display:none;">
+      <div id="gen-btn-area">
+        <div class="bg-blue-50 p-4 rounded-xl mb-6 text-gray-600 text-sm">
+          물품을 넣고 버튼을 누르면<br><strong>문이 잠깁니다.</strong>
+        </div>
+        <button id="gen-btn" onclick="generatePin()" class="w-full bg-blue-600 hover:bg-blue-700 text-white font-bold py-4 rounded-xl shadow-lg transition">
+          🔒 문 잠그기 & 비번 생성
+        </button>
+      </div>
+      <div id="gen-result-area" style="display:none;">
+        <div class="text-sm text-gray-500 mb-2">문이 잠겼습니다! (Lock)</div>
+        <div id="generated-pin-display" class="text-6xl font-mono font-black text-blue-600 mb-6">----</div>
+        <p class="text-xs text-gray-400 mb-4">
+          수령인에게 이 번호를 알려주세요.
+        </p>
+      </div>
+    </div>
+
+    <!-- 2. 입력 화면 -->
+    <div id="view-input" style="display:none;">
+      <div class="bg-yellow-50 p-4 rounded-xl mb-6 text-gray-600 text-sm">
+        물품이 도착했습니다.<br>비밀번호를 입력하면 <strong>문이 열립니다.</strong>
+      </div>
+      <input type="number" id="pin-input" placeholder="0000" maxlength="4"
+             class="w-full text-center text-4xl font-mono font-bold border-2 border-gray-200 rounded-xl py-4 mb-4 focus:outline-none focus:border-blue-500">
+      <button id="unlock-btn" onclick="tryUnlock()" class="w-full bg-green-500 hover:bg-green-600 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg">
+        🔓 문 열기 (잠금 해제)
+      </button>
+    </div>
+
+    <!-- 3. 성공 및 리셋 화면 -->
+    <div id="view-success" style="display:none;">
+      <div class="bg-green-100 p-6 rounded-full w-24 h-24 mx-auto mb-6 flex items-center justify-center animate-bounce">
+        <span class="text-4xl">🔓</span>
+      </div>
+      <h2 class="text-2xl font-bold text-green-600 mb-2">문이 열렸습니다!</h2>
+      <p class="text-gray-500 mb-6 text-sm">
+        물건을 꺼내신 후<br>초기화 버튼을 눌러주세요.
+      </p>
+      
+      <button id="close-btn" onclick="completeDelivery()" class="w-full bg-gray-600 hover:bg-gray-700 text-white font-bold py-4 rounded-xl shadow-lg transition text-lg">
+        🔄 시스템 초기화
+      </button>
+    </div>
+
+  </div>
 </body>
 </html>
